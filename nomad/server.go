@@ -20,6 +20,7 @@ import (
 	consulapi "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/consul/lib"
 	"github.com/hashicorp/go-multierror"
+	lru "github.com/hashicorp/golang-lru"
 	"github.com/hashicorp/nomad/command/agent/consul"
 	"github.com/hashicorp/nomad/helper/tlsutil"
 	"github.com/hashicorp/nomad/nomad/deploymentwatcher"
@@ -72,6 +73,10 @@ const (
 	// defaultConsulDiscoveryIntervalRetry is how often to poll Consul for
 	// new servers if there is no leader and the last Consul query failed.
 	defaultConsulDiscoveryIntervalRetry time.Duration = 9 * time.Second
+
+	// aclCacheSize is the number of ACL objects to keep cached. ACLs have a parsing and
+	// construction cost, so we keep the hot objects cached to reduce the ACL token resolution time.
+	aclCacheSize = 512
 )
 
 // Server is Nomad server which manages the job queues,
@@ -158,6 +163,9 @@ type Server struct {
 	// Worker used for processing
 	workers []*Worker
 
+	// aclCache is used to maintain the parsed ACL objects
+	aclCache *lru.TwoQueueCache
+
 	left         bool
 	shutdown     bool
 	shutdownCh   chan struct{}
@@ -178,6 +186,8 @@ type endpoints struct {
 	Periodic   *Periodic
 	System     *System
 	Operator   *Operator
+	ACL        *ACL
+	Enterprise *EnterpriseEndpoints
 }
 
 // NewServer is used to construct a new Nomad server from the
@@ -225,6 +235,12 @@ func NewServer(config *Config, consulCatalog consul.CatalogAPI, logger *log.Logg
 		incomingTLS = itls
 	}
 
+	// Create the ACL object cache
+	aclCache, err := lru.New2Q(aclCacheSize)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create the server
 	s := &Server{
 		config:        config,
@@ -240,6 +256,7 @@ func NewServer(config *Config, consulCatalog consul.CatalogAPI, logger *log.Logg
 		blockedEvals:  blockedEvals,
 		planQueue:     planQueue,
 		rpcTLS:        incomingTLS,
+		aclCache:      aclCache,
 		shutdownCh:    make(chan struct{}),
 	}
 
@@ -679,23 +696,15 @@ func (s *Server) setupConsulSyncer() error {
 // shim that provides the appropriate methods.
 func (s *Server) setupDeploymentWatcher() error {
 
-	// Create the shims
-	stateShim := &deploymentWatcherStateShim{
-		region:         s.Region(),
-		evaluations:    s.endpoints.Job.Evaluations,
-		allocations:    s.endpoints.Deployment.Allocations,
-		list:           s.endpoints.Deployment.List,
-		getDeployment:  s.endpoints.Deployment.GetDeployment,
-		getJobVersions: s.endpoints.Job.GetJobVersions,
-		getJob:         s.endpoints.Job.GetJob,
-	}
+	// Create the raft shim type to restrict the set of raft methods that can be
+	// made
 	raftShim := &deploymentWatcherRaftShim{
 		apply: s.raftApply,
 	}
 
 	// Create the deployment watcher
 	s.deploymentWatcher = deploymentwatcher.NewDeploymentsWatcher(
-		s.logger, stateShim, raftShim,
+		s.logger, raftShim,
 		deploymentwatcher.LimitStateQueriesPerSecond,
 		deploymentwatcher.CrossDeploymentEvalBatchDuration)
 
@@ -715,6 +724,7 @@ func (s *Server) setupVaultClient() error {
 // setupRPC is used to setup the RPC listener
 func (s *Server) setupRPC(tlsWrap tlsutil.RegionWrapper) error {
 	// Create endpoints
+	s.endpoints.ACL = &ACL{s}
 	s.endpoints.Alloc = &Alloc{s}
 	s.endpoints.Eval = &Eval{s}
 	s.endpoints.Job = &Job{s}
@@ -727,8 +737,10 @@ func (s *Server) setupRPC(tlsWrap tlsutil.RegionWrapper) error {
 	s.endpoints.Status = &Status{s}
 	s.endpoints.System = &System{s}
 	s.endpoints.Search = &Search{s}
+	s.endpoints.Enterprise = NewEnterpriseEndpoints(s)
 
 	// Register the handlers
+	s.rpcServer.Register(s.endpoints.ACL)
 	s.rpcServer.Register(s.endpoints.Alloc)
 	s.rpcServer.Register(s.endpoints.Eval)
 	s.rpcServer.Register(s.endpoints.Job)
@@ -741,6 +753,7 @@ func (s *Server) setupRPC(tlsWrap tlsutil.RegionWrapper) error {
 	s.rpcServer.Register(s.endpoints.Status)
 	s.rpcServer.Register(s.endpoints.System)
 	s.rpcServer.Register(s.endpoints.Search)
+	s.endpoints.Enterprise.Register(s)
 
 	list, err := net.ListenTCP("tcp", s.config.RPCAddr)
 	if err != nil {
@@ -1135,6 +1148,12 @@ func (s *Server) Datacenter() string {
 // GetConfig returns the config of the server for testing purposes only
 func (s *Server) GetConfig() *Config {
 	return s.config
+}
+
+// ReplicationToken returns the token used for replication. We use a method to support
+// dynamic reloading of this value later.
+func (s *Server) ReplicationToken() string {
+	return s.config.ReplicationToken
 }
 
 // peersInfoContent is used to help operators understand what happened to the

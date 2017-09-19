@@ -26,6 +26,16 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 	}
 
 	return map[string]cli.CommandFactory{
+		"acl": func() (cli.Command, error) {
+			return &command.ACLCommand{
+				Meta: meta,
+			}, nil
+		},
+		"acl bootstrap": func() (cli.Command, error) {
+			return &command.ACLBootstrapCommand{
+				Meta: meta,
+			}, nil
+		},
 		"alloc-status": func() (cli.Command, error) {
 			return &command.AllocStatusCommand{
 				Meta: meta,
@@ -160,6 +170,26 @@ func Commands(metaPtr *command.Meta) map[string]cli.CommandFactory {
 		},
 		"logs": func() (cli.Command, error) {
 			return &command.LogsCommand{
+				Meta: meta,
+			}, nil
+		},
+		"namespace": func() (cli.Command, error) {
+			return &command.NamespaceCommand{
+				Meta: meta,
+			}, nil
+		},
+		"namespace apply": func() (cli.Command, error) {
+			return &command.NamespaceApplyCommand{
+				Meta: meta,
+			}, nil
+		},
+		"namespace delete": func() (cli.Command, error) {
+			return &command.NamespaceDeleteCommand{
+				Meta: meta,
+			}, nil
+		},
+		"namespace list": func() (cli.Command, error) {
+			return &command.NamespaceListCommand{
 				Meta: meta,
 			}, nil
 		},

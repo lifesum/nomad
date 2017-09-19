@@ -2,7 +2,6 @@ package agent
 
 import (
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"log"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/hashicorp/nomad/helper"
 	sconfig "github.com/hashicorp/nomad/nomad/structs/config"
+	"github.com/stretchr/testify/assert"
 )
 
 func getPort() int {
@@ -57,6 +57,7 @@ func TestAgent_ServerConfig(t *testing.T) {
 	conf.AdvertiseAddrs.Serf = "127.0.0.1:4000"
 	conf.AdvertiseAddrs.RPC = "127.0.0.1:4001"
 	conf.AdvertiseAddrs.HTTP = "10.10.11.1:4005"
+	conf.ACL.Enabled = true
 
 	// Parses the advertise addrs correctly
 	if err := conf.normalizeAddrs(); err != nil {
@@ -73,6 +74,12 @@ func TestAgent_ServerConfig(t *testing.T) {
 	serfPort := out.SerfConfig.MemberlistConfig.AdvertisePort
 	if serfPort != 4000 {
 		t.Fatalf("expected 4000, got: %d", serfPort)
+	}
+	if out.AuthoritativeRegion != "global" {
+		t.Fatalf("bad: %#v", out.AuthoritativeRegion)
+	}
+	if !out.ACLEnabled {
+		t.Fatalf("ACL not enabled")
 	}
 
 	// Assert addresses weren't changed
@@ -119,7 +126,6 @@ func TestAgent_ServerConfig(t *testing.T) {
 		t.Fatalf("error normalizing config: %v", err)
 	}
 	out, err = a.serverConfig()
-	fmt.Println(conf.Addresses.RPC)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
@@ -309,6 +315,29 @@ func TestAgent_ClientConfig(t *testing.T) {
 	if c.Node.HTTPAddr != expectedHttpAddr {
 		t.Fatalf("Expected http addr: %v, got: %v", expectedHttpAddr, c.Node.HTTPAddr)
 	}
+}
+
+// Clients should inherit telemetry configuration
+func TestAget_Client_TelemetryConfiguration(t *testing.T) {
+	assert := assert.New(t)
+
+	conf := DefaultConfig()
+	conf.DevMode = true
+	conf.Telemetry.DisableTaggedMetrics = true
+	conf.Telemetry.BackwardsCompatibleMetrics = true
+
+	a := &Agent{config: conf}
+
+	c, err := a.clientConfig()
+	assert.Nil(err)
+
+	telemetry := conf.Telemetry
+
+	assert.Equal(c.StatsCollectionInterval, telemetry.collectionInterval)
+	assert.Equal(c.PublishNodeMetrics, telemetry.PublishNodeMetrics)
+	assert.Equal(c.PublishAllocationMetrics, telemetry.PublishAllocationMetrics)
+	assert.Equal(c.DisableTaggedMetrics, telemetry.DisableTaggedMetrics)
+	assert.Equal(c.BackwardsCompatibleMetrics, telemetry.BackwardsCompatibleMetrics)
 }
 
 // TestAgent_HTTPCheck asserts Agent.agentHTTPCheck properly alters the HTTP

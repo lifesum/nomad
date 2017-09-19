@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/api"
 	version "github.com/hashicorp/go-version"
 	"github.com/hashicorp/nomad/client"
@@ -66,15 +67,18 @@ type Agent struct {
 	shutdown     bool
 	shutdownCh   chan struct{}
 	shutdownLock sync.Mutex
+
+	InmemSink *metrics.InmemSink
 }
 
 // NewAgent is used to create a new agent with the given configuration
-func NewAgent(config *Config, logOutput io.Writer) (*Agent, error) {
+func NewAgent(config *Config, logOutput io.Writer, inmem *metrics.InmemSink) (*Agent, error) {
 	a := &Agent{
 		config:     config,
 		logger:     log.New(logOutput, "", log.LstdFlags|log.Lmicroseconds),
 		logOutput:  logOutput,
 		shutdownCh: make(chan struct{}),
+		InmemSink:  inmem,
 	}
 
 	if err := a.setupConsul(config.Consul); err != nil {
@@ -106,6 +110,15 @@ func convertServerConfig(agentConfig *Config, logOutput io.Writer) (*nomad.Confi
 	if agentConfig.Region != "" {
 		conf.Region = agentConfig.Region
 	}
+
+	// Set the Authoritative Region if set, otherwise default to
+	// the same as the local region.
+	if agentConfig.Server.AuthoritativeRegion != "" {
+		conf.AuthoritativeRegion = agentConfig.Server.AuthoritativeRegion
+	} else if agentConfig.Region != "" {
+		conf.AuthoritativeRegion = agentConfig.Region
+	}
+
 	if agentConfig.Datacenter != "" {
 		conf.Datacenter = agentConfig.Datacenter
 	}
@@ -133,6 +146,12 @@ func convertServerConfig(agentConfig *Config, logOutput io.Writer) (*nomad.Confi
 	}
 	if len(agentConfig.Server.EnabledSchedulers) != 0 {
 		conf.EnabledSchedulers = agentConfig.Server.EnabledSchedulers
+	}
+	if agentConfig.ACL.Enabled {
+		conf.ACLEnabled = true
+	}
+	if agentConfig.ACL.ReplicationToken != "" {
+		conf.ReplicationToken = agentConfig.ACL.ReplicationToken
 	}
 
 	// Set up the bind addresses
@@ -316,9 +335,13 @@ func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 
 	conf.ConsulConfig = a.config.Consul
 	conf.VaultConfig = a.config.Vault
+
+	// Set up Telemetry configuration
 	conf.StatsCollectionInterval = a.config.Telemetry.collectionInterval
 	conf.PublishNodeMetrics = a.config.Telemetry.PublishNodeMetrics
 	conf.PublishAllocationMetrics = a.config.Telemetry.PublishAllocationMetrics
+	conf.DisableTaggedMetrics = a.config.Telemetry.DisableTaggedMetrics
+	conf.BackwardsCompatibleMetrics = a.config.Telemetry.BackwardsCompatibleMetrics
 
 	// Set the TLS related configs
 	conf.TLSConfig = a.config.TLSConfig
@@ -336,6 +359,11 @@ func (a *Agent) clientConfig() (*clientconfig.Config, error) {
 		// Default no_host_uuid to true
 		conf.NoHostUUID = true
 	}
+
+	// Setup the ACLs
+	conf.ACLEnabled = a.config.ACL.Enabled
+	conf.ACLTokenTTL = a.config.ACL.TokenTTL
+	conf.ACLPolicyTTL = a.config.ACL.PolicyTTL
 
 	return conf, nil
 }
@@ -469,7 +497,6 @@ func (a *Agent) setupClient() error {
 		}
 	}
 
-	// Create the client
 	client, err := client.NewClient(conf, a.consulCatalog, a.consulService, a.logger)
 	if err != nil {
 		return fmt.Errorf("client setup failed: %v", err)

@@ -13,9 +13,11 @@ import (
 	"strings"
 	"time"
 
+	metrics "github.com/armon/go-metrics"
 	"github.com/hashicorp/nomad/api"
 	"github.com/hashicorp/nomad/client/fingerprint"
 	"github.com/hashicorp/nomad/nomad"
+	"github.com/hashicorp/nomad/nomad/mock"
 	"github.com/hashicorp/nomad/nomad/structs"
 	sconfig "github.com/hashicorp/nomad/nomad/structs/config"
 	"github.com/hashicorp/nomad/testutil"
@@ -66,6 +68,9 @@ type TestAgent struct {
 	// Agent is the embedded Nomad agent.
 	// It is valid after Start().
 	*Agent
+
+	// Token is auto-bootstrapped if ACLs are enabled
+	Token *structs.ACLToken
 }
 
 // NewTestAgent returns a started agent with the given name and
@@ -164,6 +169,17 @@ func (a *TestAgent) Start() *TestAgent {
 			panic(fmt.Sprintf("failed OK response: %v", err))
 		})
 	}
+
+	// Check if ACLs enabled. Use special value of PolicyTTL 0s
+	// to do a bypass of this step. This is so we can test bootstrap
+	// without having to pass down a special flag.
+	if a.Config.ACL.Enabled && a.Config.Server.Enabled && a.Config.ACL.PolicyTTL != 0 {
+		a.Token = mock.ACLManagementToken()
+		state := a.Agent.server.State()
+		if err := state.BootstrapACLTokens(1, 0, a.Token); err != nil {
+			panic(fmt.Sprintf("token bootstrap failed: %v", err))
+		}
+	}
 	return a
 }
 
@@ -172,7 +188,14 @@ func (a *TestAgent) start() (*Agent, error) {
 		a.LogOutput = os.Stderr
 	}
 
-	agent, err := NewAgent(a.Config, a.LogOutput)
+	inm := metrics.NewInmemSink(10*time.Second, time.Minute)
+	metrics.NewGlobal(metrics.DefaultConfig("service-name"), inm)
+
+	if inm == nil {
+		return nil, fmt.Errorf("unable to set up in memory metrics needed for agent initialization")
+	}
+
+	agent, err := NewAgent(a.Config, a.LogOutput, inm)
 	if err != nil {
 		return nil, err
 	}

@@ -80,8 +80,9 @@ func NewHTTPServer(agent *Agent, config *Config) (*HTTPServer, error) {
 	}
 	srv.registerHandlers(config.EnableDebug)
 
-	// Start the server
+	// Handle requests with gzip compression
 	go http.Serve(ln, gziphandler.GzipHandler(mux))
+
 	return srv, nil
 }
 
@@ -101,8 +102,9 @@ func newScadaHttp(agent *Agent, list net.Listener) *HTTPServer {
 	}
 	srv.registerHandlers(false) // Never allow debug for SCADA
 
-	// Start the server
+	// Handle requests with gzip compression
 	go http.Serve(list, gziphandler.GzipHandler(mux))
+
 	return srv
 }
 
@@ -148,6 +150,14 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/deployments", s.wrap(s.DeploymentsRequest))
 	s.mux.HandleFunc("/v1/deployment/", s.wrap(s.DeploymentSpecificRequest))
 
+	s.mux.HandleFunc("/v1/acl/policies", s.wrap(s.ACLPoliciesRequest))
+	s.mux.HandleFunc("/v1/acl/policy/", s.wrap(s.ACLPolicySpecificRequest))
+
+	s.mux.HandleFunc("/v1/acl/bootstrap", s.wrap(s.ACLTokenBootstrap))
+	s.mux.HandleFunc("/v1/acl/tokens", s.wrap(s.ACLTokensRequest))
+	s.mux.HandleFunc("/v1/acl/token", s.wrap(s.ACLTokenSpecificRequest))
+	s.mux.HandleFunc("/v1/acl/token/", s.wrap(s.ACLTokenSpecificRequest))
+
 	s.mux.HandleFunc("/v1/client/fs/", s.wrap(s.FsRequest))
 	s.mux.HandleFunc("/v1/client/stats", s.wrap(s.ClientStatsRequest))
 	s.mux.HandleFunc("/v1/client/allocation/", s.wrap(s.ClientAllocRequest))
@@ -159,6 +169,8 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/agent/force-leave", s.wrap(s.AgentForceLeaveRequest))
 	s.mux.HandleFunc("/v1/agent/servers", s.wrap(s.AgentServersRequest))
 	s.mux.HandleFunc("/v1/agent/keyring/", s.wrap(s.KeyringOperationRequest))
+
+	s.mux.HandleFunc("/v1/metrics", s.wrap(s.MetricsRequest))
 
 	s.mux.HandleFunc("/v1/validate/job", s.wrap(s.ValidateJobRequest))
 
@@ -181,6 +193,9 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 		s.mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
 		s.mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 	}
+
+	// Register enterprise endpoints.
+	s.registerEnterpriseHandlers()
 }
 
 // HTTPCodedError is used to provide the HTTP error code
@@ -351,10 +366,37 @@ func (s *HTTPServer) parseRegion(req *http.Request, r *string) {
 	}
 }
 
+// parseNamespace is used to parse the ?namespace parameter
+func parseNamespace(req *http.Request, n *string) {
+	if other := req.URL.Query().Get("namespace"); other != "" {
+		*n = other
+	} else if *n == "" {
+		*n = structs.DefaultNamespace
+	}
+}
+
+// parseToken is used to parse the X-Nomad-Token param
+func (s *HTTPServer) parseToken(req *http.Request, token *string) {
+	if other := req.Header.Get("X-Nomad-Token"); other != "" {
+		*token = other
+		return
+	}
+}
+
 // parse is a convenience method for endpoints that need to parse multiple flags
 func (s *HTTPServer) parse(resp http.ResponseWriter, req *http.Request, r *string, b *structs.QueryOptions) bool {
 	s.parseRegion(req, r)
+	s.parseToken(req, &b.SecretID)
 	parseConsistency(req, b)
 	parsePrefix(req, b)
+	parseNamespace(req, &b.Namespace)
 	return parseWait(resp, req, b)
+}
+
+// parseWriteRequest is a convience method for endpoints that need to parse a
+// write request.
+func (s *HTTPServer) parseWriteRequest(req *http.Request, w *structs.WriteRequest) {
+	parseNamespace(req, &w.Namespace)
+	s.parseToken(req, &w.SecretID)
+	s.parseRegion(req, &w.Region)
 }
